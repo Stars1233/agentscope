@@ -34,9 +34,6 @@ class ControlFrameType(StrEnum):
     INTERRUPT = "interrupt"
     """The user pressed stop, as opposed to speaking over the reply."""
 
-    EXTERNAL_EXECUTION_RESULT = "external_execution_result"
-    """The result of a tool the client ran itself."""
-
 
 class ControlFrame(BaseModel):
     """One upstream control event."""
@@ -98,10 +95,6 @@ class TransportBase(ABC):
                 The assistant item this audio belongs to, so that playback
                 position can be attributed to it.
         """
-
-    @abstractmethod
-    async def send_event(self, event: dict) -> None:
-        """Send one control event downstream."""
 
     @abstractmethod
     async def clear_audio(self) -> PlayoutPosition:

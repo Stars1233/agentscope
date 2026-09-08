@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from ._events import ModelEvent
 from ._model_card import RealtimeModelCard
 from ..credential import CredentialBase
-from ..message import Msg, ToolResultBlock
+from ..message import ToolResultBlock
 
 
 class ModelDisconnectedError(ConnectionError):
@@ -138,12 +138,6 @@ class RealtimeModelBase(ABC):
         """The PCM rate of the audio in :class:`AudioDelta`, in Hz."""
         return self.card.output_sample_rate
 
-    @property
-    @abstractmethod
-    def turn_detection_enabled(self) -> bool:
-        """Whether the provider decides turn boundaries. When ``False``
-        the caller owns endpointing and must call :meth:`commit_turn`."""
-
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -151,16 +145,13 @@ class RealtimeModelBase(ABC):
     @abstractmethod
     async def connect(
         self,
-        context: list[Msg],
         instructions: str,
         tools: list[dict] | None = None,
         **kwargs: Any,
     ) -> None:
-        """Open the session, seeding it with prior *context*.
+        """Open the session.
 
         Args:
-            context (`list[Msg]`):
-                Prior conversation, e.g. from ``AgentState.context``.
             instructions (`str`):
                 System instructions.
             tools (`list[dict] | None`, optional):
@@ -205,10 +196,8 @@ class RealtimeModelBase(ABC):
 
     @abstractmethod
     async def commit_turn(self) -> None:
-        """Declare the user turn finished.
-
-        Only called when :attr:`turn_detection_enabled` is ``False``.
-        """
+        """Declare the user turn finished. Only called when the caller owns
+        endpointing, i.e. the session was opened with turn detection off."""
 
     # ------------------------------------------------------------------
     # Response control

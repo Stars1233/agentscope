@@ -11,8 +11,10 @@ from agentscope.agent import RealtimeAgent, TurnAggregator
 from agentscope.credential import DashScopeCredential
 from agentscope.event import (
     ReplyEndEvent,
-    UserInputTranscriptionEvent,
+    ReplyStartEvent,
+    TextBlockDeltaEvent,
 )
+from agentscope.message import Msg
 from agentscope.realtime import (
     AudioFrame,
     ModelDisconnectedError,
@@ -34,7 +36,7 @@ from agentscope.event import (
     ToolResultTextDeltaEvent,
     UserConfirmResultEvent,
 )
-from agentscope.message import Msg, TextBlock, ToolCallBlock, ToolResultBlock
+from agentscope.message import TextBlock, ToolCallBlock, ToolResultBlock
 from agentscope.permission import (
     PermissionBehavior,
     PermissionContext,
@@ -86,26 +88,23 @@ class ScriptedModel(RealtimeModelBase):
         self.scripts = scripts
         self.calls: list[str] = []
         self.sessions = 0
+        self.instructions = ""
         self._open = asyncio.Event()
         self._requested = asyncio.Event()
 
-    @property
-    def turn_detection_enabled(self) -> bool:
-        """The provider owns turn boundaries unless a VAD is given."""
-        return True
-
     async def connect(
         self,
-        context: list[Msg],
         instructions: str,
         tools: list[dict] | None = None,
         **kwargs: Any,
     ) -> None:
-        """Record a session open and the turn-detection request."""
+        """Record a session open, its instructions and the turn-detection
+        request."""
         self.sessions += 1
         self._open.clear()
+        self.instructions = instructions
         self.calls.append(
-            f"connect(session={self.sessions},ctx={len(context)},"
+            f"connect(session={self.sessions},"
             f"td_off={kwargs.get('turn_detection_disabled')})",
         )
 
@@ -193,9 +192,6 @@ class FakeTransport(TransportBase):
         """Remember which item is playing."""
         self.item = item_id
 
-    async def send_event(self, event: dict) -> None:
-        """No peer to send to."""
-
     async def clear_audio(self) -> PlayoutPosition:
         """Count cuts and report the fixed playout position."""
         self.cleared += 1
@@ -211,7 +207,8 @@ class FakeTransport(TransportBase):
 
 
 class EndOnSecondFrameVAD(VADBase):
-    """Reports the user stopping on the second chunk."""
+    """Reports the user starting on the first chunk and stopping on the
+    second."""
 
     sample_rate = 16000
 
@@ -219,8 +216,10 @@ class EndOnSecondFrameVAD(VADBase):
         self.seen = 0
 
     def push(self, pcm: bytes) -> SpeechTransition | None:
-        """ENDED on the second chunk, otherwise nothing."""
+        """STARTED on the first chunk, ENDED on the second, else nothing."""
         self.seen += 1
+        if self.seen == 1:
+            return SpeechTransition.STARTED
         return SpeechTransition.ENDED if self.seen == 2 else None
 
     def reset(self) -> None:
@@ -236,14 +235,20 @@ class RealtimeAgentTest(IsolatedAsyncioTestCase):
         agent: RealtimeAgent,
         transport: FakeTransport,
     ) -> list[tuple[str, Any]]:
-        """Run the agent over *transport* and summarise the events."""
+        """Run the agent over *transport* and summarise the events: the
+        user's transcripts and how each of the agent's replies ended."""
         summary: list[tuple[str, Any]] = []
+        user_turns: set[str] = set()
         async with transport:
-            async for event in agent.run(transport):
-                if isinstance(event, ReplyEndEvent):
-                    summary.append(("reply_end", event.finished_reason))
-                elif isinstance(event, UserInputTranscriptionEvent):
-                    summary.append(("user", event.transcript))
+            async for event in agent.reply_stream(transport):
+                if isinstance(event, ReplyStartEvent) and event.role == "user":
+                    user_turns.add(event.reply_id)
+                elif isinstance(event, TextBlockDeltaEvent):
+                    if event.reply_id in user_turns:
+                        summary.append(("user", event.delta))
+                elif isinstance(event, ReplyEndEvent):
+                    if event.reply_id not in user_turns:
+                        summary.append(("reply_end", event.finished_reason))
         return summary
 
     async def test_barge_in_truncates_to_what_was_heard(self) -> None:
@@ -257,20 +262,47 @@ class RealtimeAgentTest(IsolatedAsyncioTestCase):
         agent = RealtimeAgent("Friday", "be brief", model)
         transport = FakeTransport(frames=3)
 
-        async with agent:
-            summary = await self._collect(agent, transport)
+        # Rebuild the agent's message from its events the way a client
+        # does; the text deltas ran ahead of what was heard.
+        summary = []
+        rebuilt = Msg(id="r1", role="assistant", name="Friday", content=[])
+        async with agent, transport:
+            async for event in agent.reply_stream(transport):
+                if getattr(event, "reply_id", None) == "r1":
+                    rebuilt.append_event(event)
+                if isinstance(event, ReplyStartEvent) and event.role == "user":
+                    summary.append(("user_start", event.reply_id))
+                elif isinstance(event, TextBlockDeltaEvent):
+                    summary.append(event.delta)
+                elif isinstance(event, ReplyEndEvent):
+                    summary.append(("reply_end", event.finished_reason))
 
+        # The duplicate speech_started opens the user's turn only once.
         self.assertListEqual(
             summary,
-            [("user", "讲个故事"), ("reply_end", "interrupted")],
+            [
+                ("user_start", "u1"),
+                "讲个故事",
+                ("reply_end", "completed"),  # the user's turn
+                "从前",
+                "有座山",
+                "山里",
+                "有座庙",
+                "庙里",
+                "有个",
+                "老和尚",
+                ("user_start", "u2"),
+                ("reply_end", "interrupted"),
+            ],
         )
+        self.assertEqual(rebuilt.get_text_content(), "从前有座山山里有座庙")
         self.assertEqual(transport.cleared, 1)
         # Audio frames interleave with model events on the transport's
         # clock, so they are counted rather than positioned.
         self.assertListEqual(
             [c for c in model.calls if c != "push_audio"],
             [
-                "connect(session=1,ctx=0,td_off=False)",
+                "connect(session=1,td_off=False)",
                 "truncate(r1,320ms,'从前有座山山里有座庙')",
                 "cancel",
                 "close",
@@ -309,8 +341,13 @@ class RealtimeAgentTest(IsolatedAsyncioTestCase):
             summary = await self._collect(agent, FakeTransport(frames=2))
 
         self.assertEqual(model.sessions, 2)
-        # The orphaned reply was dropped, so one message carried over.
-        self.assertIn("connect(session=2,ctx=1,td_off=False)", model.calls)
+        # The orphaned reply was dropped, so one message carried over,
+        # riding along in the instructions of the new session.
+        self.assertIn("connect(session=2,td_off=False)", model.calls)
+        self.assertEqual(
+            model.instructions,
+            "be brief\n\n## Conversation so far\nuser: 讲个故事",
+        )
         # Events produced while no run was active are delivered first;
         # a reply streamed with nobody listening is cut off exactly once.
         self.assertListEqual(
@@ -328,8 +365,9 @@ class RealtimeAgentTest(IsolatedAsyncioTestCase):
         )
 
     async def test_local_vad_owns_turns(self) -> None:
-        """Passing a VAD disables provider turn detection and commits the
-        turn when the VAD reports the user stopped."""
+        """Passing a VAD disables provider turn detection, reports the
+        user's speech as events and commits the turn when the VAD reports
+        the user stopped."""
         model = ScriptedModel([[]])
         agent = RealtimeAgent(
             "Friday",
@@ -337,13 +375,36 @@ class RealtimeAgentTest(IsolatedAsyncioTestCase):
             model,
             vad=EndOnSecondFrameVAD(),
         )
+        speech = []
         async with agent:
-            await self._collect(agent, FakeTransport(frames=3))
+            transport = FakeTransport(frames=3)
+            async with transport:
+                async for event in agent.reply_stream(transport):
+                    if isinstance(event, ReplyStartEvent):
+                        speech.append((event.type, event.role, event.reply_id))
+                    elif isinstance(event, ReplyEndEvent):
+                        speech.append(
+                            (
+                                event.type,
+                                event.finished_reason,
+                                event.reply_id,
+                            ),
+                        )
 
+        # The user's turn is a reply of its own, with a locally generated id
+        # since no provider item exists yet.
+        self.assertListEqual(
+            speech,
+            [
+                ("REPLY_START", "user", AnyString()),
+                ("REPLY_END", "completed", AnyString()),
+            ],
+        )
+        self.assertEqual(speech[0][2], speech[1][2])
         self.assertListEqual(
             model.calls,
             [
-                "connect(session=1,ctx=0,td_off=True)",
+                "connect(session=1,td_off=True)",
                 "push_audio",
                 "commit_turn",
                 "push_audio",
@@ -488,7 +549,7 @@ class RealtimeAgentToolTest(IsolatedAsyncioTestCase):
         async with agent:
             transport = FakeTransport(frames=4)
             async with transport:
-                async for event in agent.run(transport):
+                async for event in agent.reply_stream(transport):
                     match event:
                         case ToolCallStartEvent():
                             events.append(("call_start", event.tool_call_name))
@@ -538,7 +599,7 @@ class RealtimeAgentToolTest(IsolatedAsyncioTestCase):
         self.assertListEqual(
             [c for c in model.calls if not c.startswith("push_audio")],
             [
-                "connect(session=1,ctx=0,td_off=False)",
+                "connect(session=1,td_off=False)",
                 "tool_result(c1,'x-final')",
                 "request_response",
                 "close",
@@ -659,7 +720,7 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
         async with agent:
             transport = FakeTransport(frames=6)
             async with transport:
-                async for event in agent.run(transport):
+                async for event in agent.reply_stream(transport):
                     events.append(event.model_dump(mode="json"))
 
         self.assertListEqual(
@@ -669,10 +730,47 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "id": AnyString(),
                     "created_at": AnyString(),
                     "metadata": {},
-                    "type": "USER_INPUT_TRANSCRIPTION",
+                    "type": "REPLY_START",
                     "session_id": AnyString(),
-                    "item_id": "u1",
-                    "transcript": "查天气",
+                    "reply_id": "u1",
+                    "name": "user",
+                    "role": "user",
+                },
+                {
+                    "id": AnyString(),
+                    "created_at": AnyString(),
+                    "metadata": {},
+                    "type": "TEXT_BLOCK_START",
+                    "reply_id": "u1",
+                    "block_id": AnyString(),
+                },
+                {
+                    "id": AnyString(),
+                    "created_at": AnyString(),
+                    "metadata": {},
+                    "type": "TEXT_BLOCK_DELTA",
+                    "reply_id": "u1",
+                    "block_id": AnyString(),
+                    "delta": "查天气",
+                },
+                {
+                    "id": AnyString(),
+                    "created_at": AnyString(),
+                    "metadata": {},
+                    "type": "TEXT_BLOCK_END",
+                    "reply_id": "u1",
+                    "block_id": AnyString(),
+                    "text": None,
+                },
+                {
+                    "id": AnyString(),
+                    "created_at": AnyString(),
+                    "metadata": {},
+                    "type": "REPLY_END",
+                    "session_id": AnyString(),
+                    "reply_id": "u1",
+                    "finished_reason": "completed",
+                    "error": None,
                 },
                 {
                     "id": AnyString(),
@@ -737,6 +835,7 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "type": "TEXT_BLOCK_END",
                     "reply_id": "r1",
                     "block_id": AnyString(),
+                    "text": None,
                 },
                 {
                     "id": AnyString(),
@@ -757,16 +856,6 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "cache_input_tokens": 0,
                     "cache_creation_input_tokens": 0,
                     "finished_reason": "completed",
-                },
-                {
-                    "id": AnyString(),
-                    "created_at": AnyString(),
-                    "metadata": {},
-                    "type": "REPLY_END",
-                    "session_id": AnyString(),
-                    "reply_id": "r1",
-                    "finished_reason": "completed",
-                    "error": None,
                 },
                 {
                     "id": AnyString(),
@@ -825,18 +914,8 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "id": AnyString(),
                     "created_at": AnyString(),
                     "metadata": {},
-                    "type": "REPLY_START",
-                    "session_id": AnyString(),
-                    "reply_id": "r2",
-                    "name": "Friday",
-                    "role": "assistant",
-                },
-                {
-                    "id": AnyString(),
-                    "created_at": AnyString(),
-                    "metadata": {},
                     "type": "MODEL_CALL_START",
-                    "reply_id": "r2",
+                    "reply_id": "r1",
                     "model_name": "scripted",
                 },
                 {
@@ -844,7 +923,7 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "created_at": AnyString(),
                     "metadata": {},
                     "type": "TEXT_BLOCK_START",
-                    "reply_id": "r2",
+                    "reply_id": "r1",
                     "block_id": AnyString(),
                 },
                 {
@@ -852,7 +931,7 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "created_at": AnyString(),
                     "metadata": {},
                     "type": "TEXT_BLOCK_DELTA",
-                    "reply_id": "r2",
+                    "reply_id": "r1",
                     "block_id": AnyString(),
                     "delta": "今天晴",
                 },
@@ -861,7 +940,7 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "created_at": AnyString(),
                     "metadata": {},
                     "type": "DATA_BLOCK_START",
-                    "reply_id": "r2",
+                    "reply_id": "r1",
                     "block_id": AnyString(),
                     "media_type": "audio/pcm;rate=24000",
                     "name": None,
@@ -871,7 +950,7 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "created_at": AnyString(),
                     "metadata": {},
                     "type": "DATA_BLOCK_DELTA",
-                    "reply_id": "r2",
+                    "reply_id": "r1",
                     "block_id": AnyString(),
                     "media_type": "audio/pcm;rate=24000",
                     "data": "AQA=",
@@ -882,15 +961,16 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "created_at": AnyString(),
                     "metadata": {},
                     "type": "TEXT_BLOCK_END",
-                    "reply_id": "r2",
+                    "reply_id": "r1",
                     "block_id": AnyString(),
+                    "text": None,
                 },
                 {
                     "id": AnyString(),
                     "created_at": AnyString(),
                     "metadata": {},
                     "type": "DATA_BLOCK_END",
-                    "reply_id": "r2",
+                    "reply_id": "r1",
                     "block_id": AnyString(),
                 },
                 {
@@ -898,7 +978,7 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "created_at": AnyString(),
                     "metadata": {},
                     "type": "MODEL_CALL_END",
-                    "reply_id": "r2",
+                    "reply_id": "r1",
                     "input_tokens": 9,
                     "output_tokens": 3,
                     "cache_input_tokens": 0,
@@ -911,24 +991,98 @@ class RealtimeAgentFullStreamTest(IsolatedAsyncioTestCase):
                     "metadata": {},
                     "type": "REPLY_END",
                     "session_id": AnyString(),
-                    "reply_id": "r2",
+                    "reply_id": "r1",
                     "finished_reason": "completed",
                     "error": None,
                 },
             ],
         )
+        # The context records the whole turn as one assistant message: the
+        # first words, the tool call and its result, then the spoken answer.
         self.assertListEqual(
-            [(m.role, m.get_text_content()) for m in agent.state.context],
+            [m.model_dump() for m in agent.state.context],
             [
-                ("user", "查天气"),
-                ("assistant", "我查一下"),
-                ("assistant", "今天晴"),
+                {
+                    "name": "user",
+                    "role": "user",
+                    "id": "u1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "查天气",
+                            "id": AnyString(),
+                            "created_at": AnyString(),
+                            "finished_at": None,
+                        },
+                    ],
+                    "metadata": {},
+                    "created_at": AnyString(),
+                    "usage": None,
+                    "finished_at": AnyString(),
+                    "finished_reason": None,
+                    "structured_output": None,
+                    "error": None,
+                },
+                {
+                    "name": "Friday",
+                    "role": "assistant",
+                    "id": "r1",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "我查一下",
+                            "id": AnyString(),
+                            "created_at": AnyString(),
+                            "finished_at": None,
+                        },
+                        {
+                            "type": "tool_call",
+                            "id": "c1",
+                            "name": "stream_tool",
+                            "input": '{"q": "x"}',
+                            "state": "pending",
+                            "suggested_rules": [],
+                            "created_at": AnyString(),
+                            "finished_at": None,
+                        },
+                        {
+                            "type": "tool_result",
+                            "id": "c1",
+                            "name": "stream_tool",
+                            "output": "x-final",
+                            "state": "success",
+                            "metadata": {},
+                            "created_at": AnyString(),
+                            "finished_at": None,
+                        },
+                        {
+                            "type": "text",
+                            "text": "今天晴",
+                            "id": AnyString(),
+                            "created_at": AnyString(),
+                            "finished_at": None,
+                        },
+                    ],
+                    "metadata": {},
+                    "created_at": AnyString(),
+                    # Both model calls of the reply, summed.
+                    "usage": {
+                        "input_tokens": 14,
+                        "output_tokens": 5,
+                        "cache_input_tokens": 0,
+                        "cache_creation_input_tokens": 0,
+                    },
+                    "finished_at": None,
+                    "finished_reason": None,
+                    "structured_output": None,
+                    "error": None,
+                },
             ],
         )
         self.assertListEqual(
             [c for c in model.calls if c != "push_audio"],
             [
-                "connect(session=1,ctx=0,td_off=False)",
+                "connect(session=1,td_off=False)",
                 "tool_result(c1,'x-final')",
                 "request_response",
                 "close",
@@ -966,15 +1120,15 @@ class RealtimeAgentDisconnectTest(IsolatedAsyncioTestCase):
             transport = FakeTransport(frames=3)
             with self.assertLogs("as", level="INFO") as logs:
                 async with transport:
-                    async for _ in agent.run(transport):
+                    async for _ in agent.reply_stream(transport):
                         pass
 
         self.assertEqual(model.sessions, 2)
         self.assertListEqual(
             [c for c in model.calls if c != "push_audio"],
             [
-                "connect(session=1,ctx=0,td_off=False)",
-                "connect(session=2,ctx=0,td_off=False)",
+                "connect(session=1,td_off=False)",
+                "connect(session=2,td_off=False)",
                 "close",
             ],
         )

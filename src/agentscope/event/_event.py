@@ -64,9 +64,6 @@ class EventType(StrEnum):
     USER_INTERRUPT = "USER_INTERRUPT"
     EXTERNAL_EXECUTION_RESULT = "EXTERNAL_EXECUTION_RESULT"
 
-    USER_INPUT_AUDIO_START = "USER_INPUT_AUDIO_START"
-    USER_INPUT_TRANSCRIPTION = "USER_INPUT_TRANSCRIPTION"
-
     CUSTOM = "CUSTOM"
 
 
@@ -193,6 +190,9 @@ class TextBlockEndEvent(EventBase):
     """ID of the reply message this block belongs to."""
     block_id: str
     """Unique identifier of the text block."""
+    text: str | None = None
+    """The block's final text, when it is not the concatenation of the
+    deltas: a voice reply cut short is truncated to what the user heard."""
 
 
 class DataBlockStartEvent(EventBase):
@@ -565,34 +565,6 @@ class CustomEvent(EventBase):
     """Arbitrary payload."""
 
 
-class UserInputAudioStartEvent(EventBase):
-    """The user started speaking, as detected by VAD."""
-
-    type: Literal[
-        EventType.USER_INPUT_AUDIO_START
-    ] = EventType.USER_INPUT_AUDIO_START
-    """Event type."""
-    session_id: str
-    """ID of the session this input belongs to."""
-    item_id: str
-    """ID of the user input item the provider assigned."""
-
-
-class UserInputTranscriptionEvent(EventBase):
-    """The settled transcript of one spoken user turn."""
-
-    type: Literal[
-        EventType.USER_INPUT_TRANSCRIPTION
-    ] = EventType.USER_INPUT_TRANSCRIPTION
-    """Event type."""
-    session_id: str
-    """ID of the session this input belongs to."""
-    item_id: str
-    """ID of the user input item the provider assigned."""
-    transcript: str
-    """What the user said."""
-
-
 AgentEvent: TypeAlias = (
     ReplyStartEvent
     | ReplyEndEvent
@@ -621,7 +593,5 @@ AgentEvent: TypeAlias = (
     | UserConfirmResultEvent
     | UserInterruptEvent
     | ExternalExecutionResultEvent
-    | UserInputAudioStartEvent
-    | UserInputTranscriptionEvent
     | CustomEvent
 )

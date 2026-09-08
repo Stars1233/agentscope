@@ -35,8 +35,6 @@ from ._event import (
     ExternalExecutionResultEvent,
     CustomEvent,
     AgentEvent,
-    UserInputAudioStartEvent,
-    UserInputTranscriptionEvent,
     ConfirmResult,
 )
 
@@ -75,7 +73,5 @@ __all__ = [
     "ExternalExecutionResultEvent",
     "CustomEvent",
     "AgentEvent",
-    "UserInputAudioStartEvent",
-    "UserInputTranscriptionEvent",
     "ConfirmResult",
 ]
