@@ -24,6 +24,7 @@ from ._events import (
     TranscriptDeltaEvent,
 )
 from ._model_card import RealtimeModelCard
+from ._openai import OpenAIRealtimeModel
 from ._playout import PlayoutPosition
 from ._transport import (
     AudioFrame,
@@ -41,6 +42,7 @@ __all__ = [
     "RealtimeModelBase",
     "DashScopeRealtimeModel",
     "DashScopeAudioRealtimeModel",
+    "OpenAIRealtimeModel",
     "XAIRealtimeModel",
     "RealtimeModelCard",
     "TruncationSupport",
