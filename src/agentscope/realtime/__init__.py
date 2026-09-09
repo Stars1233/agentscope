@@ -23,6 +23,7 @@ from ._events import (
     ToolCallEvent,
     TranscriptDeltaEvent,
 )
+from ._gemini import GeminiRealtimeModel
 from ._model_card import RealtimeModelCard
 from ._openai import OpenAIRealtimeModel
 from ._playout import PlayoutPosition
@@ -42,6 +43,7 @@ __all__ = [
     "RealtimeModelBase",
     "DashScopeRealtimeModel",
     "DashScopeAudioRealtimeModel",
+    "GeminiRealtimeModel",
     "OpenAIRealtimeModel",
     "XAIRealtimeModel",
     "RealtimeModelCard",
